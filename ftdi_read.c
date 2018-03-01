@@ -6,8 +6,6 @@
 
 #include <libftdi1/ftdi.h>
 
-#define LEN 0xFFFF
-
 /* Wiring:
  *  VCC - VCC (red)
  *  Trig - GPIOL0 (gray)
@@ -15,19 +13,35 @@
  *  GND - GND (black)
  */
 
-unsigned int elapsed_ns(const struct timespec *start, const struct timespec *end) {
-	return (end->tv_sec - start->tv_sec)*1e9 + (end->tv_nsec - start->tv_nsec);
+/* Useful references:
+ *   http://www.ftdichip.com/Support/Documents/AppNotes/AN_108_Command_Processor_for_MPSSE_and_MCU_Host_Bus_Emulation_Modes.pdf
+ *   https://www.intra2net.com/en/developer/libftdi/documentation/group__libftdi.html
+ *   https://www.intra2net.com/en/developer/libftdi/documentation/ftdi_8h_source.html
+ */
+
+unsigned int elapsed_ns(const struct timespec *start) {
+	struct timespec current;
+	clock_gettime(CLOCK_MONOTONIC, &current);
+	return (current.tv_sec - start->tv_sec)*1e9 + (current.tv_nsec - start->tv_nsec);
 }
 
 void sample(struct ftdi_context *ftdi) {
-	char buf[3];
-	// SET_BITS_LOW configures the first 8 lines <value> <direction>
+	/* The HC-SR04 has a trigger input line and a pulse length output.
+	 * A read is triggered by a 10us high pulse on the trigger line.
+	 * The value is returned as a variable width pulse on the echo line.
+	 */
+
+	uint8_t buf[3]; // All the MPSSE commands we need are three bytes
+
+
+	// SET_BITS_LOW configures the first 8 GPIOs (low bank)
+	// 1: value bit field
+	// 2: direction bit field, high = output
 	buf[0] = SET_BITS_LOW;
 	buf[1] = 0xFF; // drive outputs high
-	buf[2] = 0x10; // GPIOL0 == output, all others = input
-	int ret;
+	buf[2] = 0x10; // GPIOL0 -> output, all others -> input
 	if (ftdi_write_data(ftdi, buf, 3) != 3) {
-		printf("Error: Sending gpio high command\n");
+		fprintf(stderr, "Error: Sending gpio high command\n");
 		return;
 	}
 
@@ -36,16 +50,24 @@ void sample(struct ftdi_context *ftdi) {
 
 	buf[1] = 0; // drive outputs low
 	if (ftdi_write_data(ftdi, buf, 3) != 3) {
-		printf("Error: Sending gpio low command\n");
+		fprintf(stderr, "Error: Sending gpio low command\n");
 		return;
 	}
 
-	buf[0] = 0x2C; // MPSSE_DO_READ | ??
-	buf[1] = (LEN-1) & 0xFF;
-	buf[2] = (LEN-1) >> 8;
 
+	/* MPSSE clock data bytes in on -ve clock edge, LSB first
+	 * This is a multibyte JTAG read command
+	 * Every clock edge the FTDI chip will read the value of
+	 * the echo line and store it as a bit.
+	 * We trigger the maximum number of reads to get the biggest window.
+	 * 1: LengthL, 2: LengthH (Length is 1 offset)
+	 */
+#define LEN 0x10000
+	buf[0] = 0x2C;
+	buf[1] = (LEN-1)&0xFF; // LengthL
+	buf[2] = (LEN-1)>>8; // LengthH
 	if (ftdi_write_data(ftdi, buf, 3) != 3) {
-		printf("Error: Sending initiate read command\n");
+		fprintf(stderr, "Error: Sending initiate read command\n");
 		return;
 	}
 
@@ -53,16 +75,13 @@ void sample(struct ftdi_context *ftdi) {
 
 	// read doesn't wait, returns up to requested length
 	int sofar = 0;
-	struct timespec ts_start, ts_current;
+	struct timespec ts_start;
 	clock_gettime(CLOCK_MONOTONIC, &ts_start);
 	do {
-		ret = ftdi_read_data(ftdi, out+sofar, LEN-sofar);
-		sofar += ret;
-		clock_gettime(CLOCK_MONOTONIC, &ts_current);
-		// printf("rread %d %d %d\n", ret, sofar, elapsed_ns(&ts_start, &ts_current));
-	} while (sofar < LEN && elapsed_ns(&ts_start, &ts_current) < 1e9);
+		sofar += ftdi_read_data(ftdi, out+sofar, LEN-sofar);
+	} while (sofar < LEN && elapsed_ns(&ts_start) < 1e9);
 	if (sofar < LEN) {
-		printf("Error: timeout on read - probably far distance\n");
+		fprintf(stderr, "Error: timeout on read - probably far distance\n");
 		return;
 	}
 
@@ -78,7 +97,7 @@ void sample(struct ftdi_context *ftdi) {
 		}
 	}
 	if (!start) {
-		printf("Error: No high bits\n");
+		fprintf(stderr, "Error: No high bits\n");
 		return;
 	}
 
@@ -91,28 +110,38 @@ void sample(struct ftdi_context *ftdi) {
 		}
 	}
 	if (end == LEN) {
-		printf("Error: No pulse end\n");
+		fprintf(stderr, "Error: No pulse end\n");
 		return;
 	}
 
-	printf("Dist %f\n", (float)(end-start)/34800);
 
 	// We default to a 6MHz sample frequency
 	// 425162 samps 6M samps/s = 0.07s
 	// HC-SR04 gives the following formula for air: cm = us/58
 	// 100m = 0.001s/58
-	// samps / 6M = ?s
 	// m = us/5800
 	//   = u(samps / 6M)/5800
 	//   = samps / 34800 (m)
-	//
-	//   TODO: Values seem to be about 90% of real
+	// printf("Dist %f\n", (float)(end-start)/34800);
+	// Seems to be about 90% of measured value, from end of can
+	
+	// Using fundamentals, again from the datasheet:
+	// range = high level time * velocity (340M/S) / 2;
+	// m = s*340/2 = s*170
+	// m = samps/6M*170
+	// m = samps *0.000028333 = samps / 35294
+	//printf("Dist %f\n", (float)(end-start)/6e6*340/2);
+	// Again, seems to be about 90% of measured value
+
+	// Hand corrected factor, tested accurate over 10-30cm range
+	printf("Dist %f\n", (double)(end-start)/31750);
 }
 
-static int terminate = 0;
 
-void intHandler(int whocares) {
-	terminate = 1;
+static int run = 1;
+
+void intHandler(int ignored) {
+	run = 0;
 }
 
 int main(void) {
@@ -130,30 +159,27 @@ int main(void) {
 		goto ftdi_error;
 	}
 
-	ftdi_usb_reset(ftdi);
-	ftdi_set_interface(ftdi, INTERFACE_A);
-	ftdi_set_latency_timer(ftdi, 1);
-	ftdi_set_bitmode(ftdi, 0xfb, BITMODE_MPSSE);
+	if (ftdi_usb_reset(ftdi) < 0) goto configure_error;
+	if (ftdi_set_interface(ftdi, INTERFACE_A) < 0) goto configure_error;
+	if (ftdi_set_latency_timer(ftdi, 1) < 0) goto configure_error;
+	if (ftdi_set_bitmode(ftdi, 0xfb, BITMODE_MPSSE) < 0) goto configure_error;
 
-	printf("type %d\n", ftdi->type); // output to reassure that we are running
-
-
+	// Set up interrupt handler, so we close nicely on a Ctrl-C event
 	struct sigaction act;
 	act.sa_handler = intHandler;
 	sigaction(SIGINT, &act, NULL);
 
-	while(!terminate) {
+	while(run) {
 		sample(ftdi);
 	}
-
-
 
 	ftdi_usb_close(ftdi);
 	ftdi_free(ftdi);
 
 	return 0;
 
-open_error:
+configure_error:
+	fprintf(stderr, "unable to configure ftdi device: %s\n", ftdi_get_error_string(ftdi));
 	ftdi_usb_close(ftdi);
 
 ftdi_error:
